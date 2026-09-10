@@ -105,6 +105,9 @@ class EvaluateSplitAgent {
         kBlockSize == WARP_SIZE,
         "This kernel relies on the assumption block_size == warp_size");
 #endif
+#if defined(XGBOOST_USE_HIP)
+    KERNEL_CHECK(blockDim.x == warpSize);
+#endif
     // There should be no missing value gradients for a dense matrix
 #if !defined(XGBOOST_USE_HIP) // disable on Navi due to a ROCm bug
     KERNEL_CHECK(!shared_inputs.is_dense || missing.GetQuantisedHess() == 0);
@@ -388,17 +391,37 @@ void GPUHistEvaluator::LaunchEvaluateSplits(
   dh::TemporaryArray<DeviceSplitCandidate> feature_best_splits(
       combined_num_features, DeviceSplitCandidate());
 
-  // One block for each feature
+  // One block for each feature. XGB_HIP_WARP_DISPATCH_V3
 #if defined(XGBOOST_USE_HIP)
-uint32_t constexpr kBlockThreads = 64;  // AMD wavefront size
+  int hip_warp_size = 0;
+  dh::safe_cuda(hipDeviceGetAttribute(
+      &hip_warp_size, hipDeviceAttributeWarpSize, ctx->Ordinal()));
+  CHECK(hip_warp_size == 32 || hip_warp_size == 64)
+      << "XGB_HIP_WARP_DISPATCH_V3 unsupported HIP warp size: " << hip_warp_size;
+
+  if (hip_warp_size == 32) {
+    uint32_t constexpr kBlockThreads = 32;
+    dh::LaunchKernel{static_cast<uint32_t>(combined_num_features), kBlockThreads, 0,  // NOLINT
+                     ctx->CUDACtx()->Stream()}(
+        EvaluateSplitsKernel<kBlockThreads>, max_active_features, d_inputs, shared_inputs,
+        this->SortedIdx(d_inputs.size(), shared_inputs.feature_values.size()), evaluator,
+        dh::ToSpan(feature_best_splits));
+  } else {
+    uint32_t constexpr kBlockThreads = 64;
+    dh::LaunchKernel{static_cast<uint32_t>(combined_num_features), kBlockThreads, 0,  // NOLINT
+                     ctx->CUDACtx()->Stream()}(
+        EvaluateSplitsKernel<kBlockThreads>, max_active_features, d_inputs, shared_inputs,
+        this->SortedIdx(d_inputs.size(), shared_inputs.feature_values.size()), evaluator,
+        dh::ToSpan(feature_best_splits));
+  }
 #else
-uint32_t constexpr kBlockThreads = 32;  // NVIDIA warp size  
-#endif
+  uint32_t constexpr kBlockThreads = 32;  // NVIDIA warp size
   dh::LaunchKernel{static_cast<uint32_t>(combined_num_features), kBlockThreads, 0,  // NOLINT
                    ctx->CUDACtx()->Stream()}(
       EvaluateSplitsKernel<kBlockThreads>, max_active_features, d_inputs, shared_inputs,
       this->SortedIdx(d_inputs.size(), shared_inputs.feature_values.size()), evaluator,
       dh::ToSpan(feature_best_splits));
+#endif
 
   // Reduce to get best candidate for left and right child over all features
   auto reduce_offset = dh::MakeTransformIterator<size_t>(
