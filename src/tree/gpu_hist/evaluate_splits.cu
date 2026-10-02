@@ -3,6 +3,7 @@
  */
 #include <algorithm>  // for :max
 #include <limits>     // for numeric_limits
+#include <type_traits>  // for integral_constant
 
 #include "../../collective/allgather.h"
 #include "../../collective/communicator-inl.h"  // for GetWorldSize, GetRank
@@ -17,7 +18,8 @@
 #include <GPUTreeShap/gpu_treeshap.h>
 #include "../../common/device_helpers.hip.h"
 int warp_size_hip_xgb = 0;
-constexpr unsigned long long kFullMask = 0xffffffffffffffffULL;  // 64-bit wavefront
+// All lanes. HIP >= 7 clips the 64-bit mask to the wavefront size on wave32 targets.
+constexpr unsigned long long kFullMask = 0xffffffffffffffffULL;
 
 #if HIP_VERSION_MAJOR < 7
 using hip_warp_primitives::__syncwarp;
@@ -391,36 +393,31 @@ void GPUHistEvaluator::LaunchEvaluateSplits(
   dh::TemporaryArray<DeviceSplitCandidate> feature_best_splits(
       combined_num_features, DeviceSplitCandidate());
 
-  // One block for each feature. XGB_HIP_WARP_DISPATCH_V3
+  // One block for each feature. The kernel requires block_size == warp_size, which is 32 on
+  // NVIDIA and AMD RDNA (gfx10+, e.g. gfx1100), and 64 on AMD GCN/CDNA (gfx9, e.g. gfx942).
+  // Both HIP variants are compiled for every offload target, the one matching the device
+  // that runs the kernel is selected here.
+  auto launch = [&](auto warp_threads) {
+    uint32_t constexpr kBlockThreads = decltype(warp_threads)::value;
+    dh::LaunchKernel{static_cast<uint32_t>(combined_num_features), kBlockThreads, 0,  // NOLINT
+                     ctx->CUDACtx()->Stream()}(
+        EvaluateSplitsKernel<kBlockThreads>, max_active_features, d_inputs, shared_inputs,
+        this->SortedIdx(d_inputs.size(), shared_inputs.feature_values.size()), evaluator,
+        dh::ToSpan(feature_best_splits));
+  };
 #if defined(XGBOOST_USE_HIP)
-  int hip_warp_size = 0;
-  dh::safe_cuda(hipDeviceGetAttribute(
-      &hip_warp_size, hipDeviceAttributeWarpSize, ctx->Ordinal()));
-  CHECK(hip_warp_size == 32 || hip_warp_size == 64)
-      << "XGB_HIP_WARP_DISPATCH_V3 unsupported HIP warp size: " << hip_warp_size;
-
-  if (hip_warp_size == 32) {
-    uint32_t constexpr kBlockThreads = 32;
-    dh::LaunchKernel{static_cast<uint32_t>(combined_num_features), kBlockThreads, 0,  // NOLINT
-                     ctx->CUDACtx()->Stream()}(
-        EvaluateSplitsKernel<kBlockThreads>, max_active_features, d_inputs, shared_inputs,
-        this->SortedIdx(d_inputs.size(), shared_inputs.feature_values.size()), evaluator,
-        dh::ToSpan(feature_best_splits));
-  } else {
-    uint32_t constexpr kBlockThreads = 64;
-    dh::LaunchKernel{static_cast<uint32_t>(combined_num_features), kBlockThreads, 0,  // NOLINT
-                     ctx->CUDACtx()->Stream()}(
-        EvaluateSplitsKernel<kBlockThreads>, max_active_features, d_inputs, shared_inputs,
-        this->SortedIdx(d_inputs.size(), shared_inputs.feature_values.size()), evaluator,
-        dh::ToSpan(feature_best_splits));
+  switch (dh::WarpThreads(ctx->Ordinal())) {
+    case 32:
+      launch(std::integral_constant<std::uint32_t, 32>{});
+      break;
+    case 64:
+      launch(std::integral_constant<std::uint32_t, 64>{});
+      break;
+    default:
+      LOG(FATAL) << "XGB_HIP_WARP_DISPATCH_V4 unsupported HIP warp size";
   }
 #else
-  uint32_t constexpr kBlockThreads = 32;  // NVIDIA warp size
-  dh::LaunchKernel{static_cast<uint32_t>(combined_num_features), kBlockThreads, 0,  // NOLINT
-                   ctx->CUDACtx()->Stream()}(
-      EvaluateSplitsKernel<kBlockThreads>, max_active_features, d_inputs, shared_inputs,
-      this->SortedIdx(d_inputs.size(), shared_inputs.feature_values.size()), evaluator,
-      dh::ToSpan(feature_best_splits));
+  launch(std::integral_constant<std::uint32_t, 32>{});  // NVIDIA warp size
 #endif
 
   // Reduce to get best candidate for left and right child over all features
