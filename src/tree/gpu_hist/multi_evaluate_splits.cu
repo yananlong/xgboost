@@ -27,6 +27,22 @@
 namespace xgboost::tree::cuda_impl {
 namespace {
 /**
+ * @brief Number of warps in a thread block, used to size the launch grid.
+ *
+ * The kernels below treat each warp as a unit of work. On HIP the warp (wavefront) size is 32
+ * on RDNA and 64 on CDNA, the host can only query it at runtime for the device in use. Device
+ * code uses `dh::WarpThreads()`, which is derived from the offload target being compiled.
+ */
+template <std::int32_t kBlockThreads>
+[[nodiscard]] std::int32_t WarpsPerBlock([[maybe_unused]] Context const *ctx) {
+#if defined(XGBOOST_USE_HIP)
+  return kBlockThreads / dh::WarpThreads(ctx->Ordinal());
+#else
+  return kBlockThreads / dh::WarpThreads();
+#endif
+}
+
+/**
  * @brief Calculate the gradient index for the reverse pass
  *
  * @note All inputs are global across features.
@@ -344,9 +360,9 @@ void MultiHistEvaluator::EvaluateSplits(Context const *ctx,
   // Launch histogram scan kernel, each warp handles one target of one feature of one node.
   {
     std::uint32_t constexpr kBlockThreads = 512;
-    constexpr std::int32_t kWarpsPerBlk = kBlockThreads / dh::WarpThreads();
+    auto const n_warps_per_blk = WarpsPerBlock<kBlockThreads>(ctx);
     auto n_warps = n_nodes * n_targets * n_features;
-    auto n_blocks = common::DivRoundUp(n_warps, kWarpsPerBlk);
+    auto n_blocks = common::DivRoundUp(n_warps, n_warps_per_blk);
     dh::LaunchKernel{n_blocks, kBlockThreads}(  // NOLINT
         ScanHistogramKernel<kBlockThreads>, d_inputs, shared_inputs, dh::ToSpan(scans));
   }
@@ -355,9 +371,9 @@ void MultiHistEvaluator::EvaluateSplits(Context const *ctx,
   dh::device_vector<MultiSplitCandidate> d_splits(n_nodes * n_features);
   {
     std::uint32_t constexpr kBlockThreads = 512;
-    constexpr std::int32_t kWarpsPerBlk = kBlockThreads / dh::WarpThreads();
+    auto const n_warps_per_blk = WarpsPerBlock<kBlockThreads>(ctx);
     auto n_warps = n_nodes * n_features;
-    auto n_blocks = common::DivRoundUp(n_warps, kWarpsPerBlk);
+    auto n_blocks = common::DivRoundUp(n_warps, n_warps_per_blk);
     dh::LaunchKernel{n_blocks, kBlockThreads, 0, ctx->CUDACtx()->Stream()}(  // NOLINT
         EvaluateSplitsKernel<kBlockThreads>, d_inputs, shared_inputs, dh::ToSpan(scans),
         dh::ToSpan(d_splits));

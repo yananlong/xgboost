@@ -154,8 +154,31 @@ inline auto GetDevice(xgboost::Context const* ctx) {
   return d;
 }
 
-/** \brief Warp size in threads. AMD supports 64; use 32 for CUDA compatibility. */
-constexpr int WarpThreads() { return 64; }
+/**
+ * @brief Number of threads in a warp (wavefront) of the offload target being compiled.
+ *
+ * The wavefront size depends on the GPU architecture: 32 for RDNA (gfx10 and later,
+ * including gfx1100) and 64 for GCN/CDNA (gfx9, including gfx942). Device code gets the value
+ * of the target it's compiled for. This function is intentionally device-only, host code
+ * doesn't know which target a kernel will run on and must use `WarpThreads(ordinal)`.
+ */
+__device__ constexpr std::int32_t WarpThreads() {
+  return static_cast<std::int32_t>(HIPCUB_DEVICE_WARP_THREADS);
+}
+
+/**
+ * @brief Query the number of threads in a warp (wavefront) of the given device.
+ *
+ * Only 32 and 64 are supported, anything else is a fatal error instead of a silently wrong
+ * kernel launch.
+ */
+inline std::int32_t WarpThreads(std::int32_t ordinal) {
+  std::int32_t n_threads{0};
+  safe_cuda(hipDeviceGetAttribute(&n_threads, hipDeviceAttributeWarpSize, ordinal));
+  CHECK(n_threads == 32 || n_threads == 64)
+      << "XGB_HIP_WARP_DISPATCH_V4 unsupported HIP warp size: " << n_threads;
+  return n_threads;
+}
 
 inline size_t TotalMemory(int device_idx) {
   size_t device_free = 0;
